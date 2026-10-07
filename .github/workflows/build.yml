@@ -57,7 +57,9 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
           echo "CONFIG_KSU=y" >> out/.config
+          echo "CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y" >> out/.config
           echo "# CONFIG_KPROBES is not set" >> out/.config
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           ls -la drivers | grep -i kernelsu || echo "WARNING: drivers/kernelsu not found"
           grep -l "ksu" fs/exec.c fs/open.c fs/stat.c 2>/dev/null || echo "NOTE: no ksu hooks found in fs/*.c"
 
