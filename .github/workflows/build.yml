@@ -18,7 +18,7 @@ env:
   BASE_CONFIG: vendor/xiaomi/sdm660_defconfig
   DEVICE_FRAGMENT: vendor/xiaomi/lavender.config
   CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r596125
-  AK3_REPO: https://github.com/LavenderLabz/AnyKernel3
+  AK3_REPO: https://github.com/PrinceOC912/AnyKernel3
 
 jobs:
   build:
