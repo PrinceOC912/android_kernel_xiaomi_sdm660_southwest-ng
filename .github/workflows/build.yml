@@ -15,7 +15,8 @@ on:
           - none
 
 env:
-  DEFCONFIG: vendor/xiaomi/lavender_defconfig
+  BASE_CONFIG: vendor/xiaomi/sdm660_defconfig
+  DEVICE_FRAGMENT: vendor/xiaomi/lavender.config
   CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r596125
   AK3_REPO: https://github.com/LavenderLabz/AnyKernel3
 
@@ -49,7 +50,7 @@ jobs:
       - name: Configure
         run: |
           mkdir -p out
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 "$BASE_CONFIG" "$DEVICE_FRAGMENT"
 
       - name: Add KernelSU (backslashxx)
         if: github.event.inputs.ksu == 'backslashxx'
