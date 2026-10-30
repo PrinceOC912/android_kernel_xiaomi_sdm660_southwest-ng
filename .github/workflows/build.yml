@@ -1,4 +1,4 @@
-name: Build SouthWest-NG lavender + KernelSU (backslashxx)
+name: Build SouthWest-NG lavender + KernelSU (+ SUSFS)
 
 on:
   workflow_dispatch:
@@ -9,20 +9,34 @@ on:
       ksu:
         description: "KernelSU variant"
         type: choice
-        default: "backslashxx"
+        default: "xxksu"
         options:
-          - backslashxx
+          - xxksu
+          - xxksu-susfs
+          - bakasu-susfs
           - none
+      susfs_source:
+        description: "SUSFS source (auto = try latest, fall back to vendored)"
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - latest
+          - vendored
 
 env:
   BASE_CONFIG: vendor/xiaomi/sdm660_defconfig
   DEVICE_FRAGMENT: vendor/xiaomi/lavender.config
   CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r596125
   AK3_REPO: https://github.com/PrinceOC912/AnyKernel3
+  SUSFS_DIR: .github/workflows/susfs
+  NGKI_RAW: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline
+  SUSFS_FALLBACK_VERSION: v2.3.0
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - name: Free disk space
         run: |
@@ -32,7 +46,7 @@ jobs:
       - name: Checkout kernel
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ inputs.branch }}
           fetch-depth: 1
 
       - name: Install dependencies
@@ -44,7 +58,7 @@ jobs:
       - name: Get clang (r596125)
         run: |
           git clone --depth=1 "$CLANG_REPO" "$PWD/tc/clang"
-          echo "$PWD/tc/clang/bin" >> $GITHUB_PATH
+          echo "$PWD/tc/clang/bin" >> "$GITHUB_PATH"
           "$PWD/tc/clang/bin/clang" --version | head -n1
 
       - name: Configure
@@ -52,19 +66,339 @@ jobs:
           mkdir -p out
           make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 "$BASE_CONFIG" "$DEVICE_FRAGMENT"
 
-      - name: Add KernelSU (backslashxx)
-        if: github.event.inputs.ksu == 'backslashxx'
+      # --- KSU ---
+      - name: Add KernelSU
+        if: inputs.ksu != 'none'
+        shell: bash
+        env:
+          KSU_VARIANT: ${{ inputs.ksu }}
         run: |
-          curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
-          echo "CONFIG_KSU=y" >> out/.config
-          echo "CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y" >> out/.config
-          echo "# CONFIG_KPROBES is not set" >> out/.config
-          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-          ls -la drivers | grep -i kernelsu || echo "WARNING: drivers/kernelsu not found"
-          grep -l "ksu" fs/exec.c fs/open.c fs/stat.c 2>/dev/null || echo "NOTE: no ksu hooks found in fs/*.c"
+          set -euo pipefail
+          rm -rf KernelSU drivers/kernelsu
+          case "$KSU_VARIANT" in
+            xxksu|xxksu-susfs)
+              curl -fLSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
+              ;;
+            bakasu-susfs)
+              curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+              ;;
+            *)
+              echo "::error::unknown ksu variant '$KSU_VARIANT'"
+              exit 1
+              ;;
+          esac
+          test -d KernelSU/kernel
+          echo "KernelSU at: $(git -C KernelSU log -1 --format='%h %ad %s' --date=short)"
 
-      - name: Build
+      # --- SUSFS ---
+      - name: Apply SUSFS
+        if: inputs.ksu == 'xxksu-susfs' || inputs.ksu == 'bakasu-susfs'
+        id: susfs
+        shell: bash
+        env:
+          KSU_VARIANT: ${{ inputs.ksu }}
+          SUSFS_SOURCE: ${{ inputs.susfs_source }}
         run: |
+          set -euo pipefail
+          SD="$GITHUB_WORKSPACE/$SUSFS_DIR"
+          VENDOR="$SD/vendor"
+          WORK="$RUNNER_TEMP/susfs"
+          mkdir -p "$WORK"
+
+          baseline="$(git status --porcelain=v1 | awk '{print $2}')"
+
+          reset_tree() {
+            git status --porcelain=v1 | while IFS= read -r line; do
+              f="${line:3}"
+              f="${f%% -> *}"
+              [ -n "$f" ] || continue
+              if printf '%s\n' "$baseline" | grep -qxF -- "$f"; then
+                continue
+              fi
+              if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+                git checkout -- "$f"
+              else
+                rm -rf -- "$f"
+              fi
+            done
+            find . -name '*.rej'  -not -path './KernelSU/*' -delete 2>/dev/null || true
+            find . -name '*.orig' -not -path './KernelSU/*' -delete 2>/dev/null || true
+          }
+
+          patch_version() {
+            local v
+            v="$(grep -m1 -oE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' "$1" \
+                 | sed -E 's/.*"([^"]+)".*/\1/')" || true
+            [ -n "$v" ] || return 1
+            printf '%s\n' "$v"
+          }
+
+          pick_overlay() {
+            local ver="$1" mm f
+            mm="$(printf '%s\n' "$ver" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')"
+            if [ "$KSU_VARIANT" = "bakasu-susfs" ]; then
+              f="$SD/fixup_4.19_${mm}_hooks.patch"
+            else
+              f="$SD/fixup_4.19_${mm}_nohook.patch"
+            fi
+            [ -f "$f" ] || { echo "no overlay for SUSFS $ver: $f" >&2; return 1; }
+            printf '%s\n' "$f"
+          }
+
+          check_rejects() {
+            local label="$1" ok=1 e f n got actual want
+            want="$(printf '%s\n' fs/namespace.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/super.c | sort)"
+            actual="$(find . -name '*.rej' -not -path './KernelSU/*' | sed -e 's|^\./||' -e 's|\.rej$||' | sort)"
+            if [ "$actual" != "$want" ]; then
+              echo "::error::[$label] unexpected reject set"
+              echo "--- expected ---"; printf '%s\n' "$want"
+              echo "--- actual ---";   printf '%s\n' "$actual"
+              ok=0
+            fi
+            for e in fs/namespace.c:2 fs/proc/cmdline.c:1 fs/proc/task_mmu.c:1 fs/super.c:1; do
+              f="${e%%:*}"; n="${e##*:}"
+              if [ ! -f "$f.rej" ]; then
+                echo "::error::[$label] missing $f.rej"
+                ok=0
+                continue
+              fi
+              got="$(grep -c '^@@' "$f.rej" || true)"
+              if [ "$got" != "$n" ]; then
+                echo "::error::[$label] $f.rej has $got hunk(s), expected $n"
+                ok=0
+              fi
+            done
+            if [ "$ok" -eq 1 ]; then
+              echo "[$label] reject gate OK: 4 files / 5 hunks, all expected"
+              return 0
+            fi
+            return 1
+          }
+
+          fetch_latest() {
+            local d="$WORK/latest"
+            rm -rf "$d"; mkdir -p "$d"
+            curl -fLSs --retry 3 --retry-delay 2 \
+              -o "$d/susfs_patch_to_4.19.patch" \
+              "$NGKI_RAW/Patches/Patch/susfs_patch_to_4.19.patch"
+            curl -fLSs --retry 3 --retry-delay 2 \
+              -o "$d/susfs_inline_hook_patches.sh" \
+              "$NGKI_RAW/Patches/susfs_inline_hook_patches.sh"
+            grep -q '^diff --git' "$d/susfs_patch_to_4.19.patch" \
+              || { echo "downloaded kernel patch is not a patch" >&2; return 1; }
+            grep -q 'patch_files=' "$d/susfs_inline_hook_patches.sh" \
+              || { echo "downloaded hook script is not the expected script" >&2; return 1; }
+            printf '%s\n' "$d"
+          }
+
+          RESULT_VER=""
+          apply_source() {
+            local dir="$1" label="$2" patch fixup ver prc=0
+            patch="$dir/susfs_patch_to_4.19.patch"
+            ver="$(patch_version "$patch")" || { echo "[$label] cannot read SUSFS_VERSION"; return 1; }
+            fixup="$(pick_overlay "$ver")" || return 1
+
+            echo "::group::[$label] SUSFS $ver"
+            echo "patch:   $patch"
+            echo "overlay: $fixup"
+
+            if [ "$KSU_VARIANT" = "bakasu-susfs" ]; then
+              if ! bash "$dir/susfs_inline_hook_patches.sh" > "$WORK/inline-$label.log" 2>&1; then
+                echo "[$label] inline hook script exited non-zero"
+                tail -n 60 "$WORK/inline-$label.log"
+                echo "::endgroup::"
+                return 1
+              fi
+              if grep -qiE 'patch failed|failed for unknown reasons' "$WORK/inline-$label.log"; then
+                echo "[$label] inline hook script reported a failed patch"
+                tail -n 60 "$WORK/inline-$label.log"
+                echo "::endgroup::"
+                return 1
+              fi
+              grep -E 'Patched!|Skipped|Warning' "$WORK/inline-$label.log" || true
+            fi
+
+            patch -p1 --no-backup-if-mismatch < "$patch" > "$WORK/kernel-$label.log" 2>&1 || prc=$?
+            echo "patch exit=$prc (non-zero is expected: the overlay repairs 5 hunks)"
+            grep -E 'FAILED|saving rejects|with fuzz' "$WORK/kernel-$label.log" || true
+
+            if ! check_rejects "$label"; then
+              echo "::endgroup::"
+              return 1
+            fi
+            find . -name '*.rej'  -not -path './KernelSU/*' -delete 2>/dev/null || true
+            find . -name '*.orig' -not -path './KernelSU/*' -delete 2>/dev/null || true
+            if ! git apply --check "$fixup"; then
+              echo "[$label] overlay does not apply"
+              echo "::endgroup::"
+              return 1
+            fi
+            if ! git apply "$fixup"; then
+              echo "[$label] overlay failed to apply"
+              echo "::endgroup::"
+              return 1
+            fi
+
+            RESULT_VER="$ver"
+            echo "[$label] overlay applied -> SUSFS $ver"
+            echo "::endgroup::"
+            return 0
+          }
+
+          if [ "$KSU_VARIANT" = "xxksu-susfs" ]; then
+            echo "::group::xxksu SUSFS glue"
+            if ! git -C KernelSU apply "$SD/xxksu-susfs.patch"; then
+              echo "::error::xxksu-susfs.patch does not apply to KernelSU $(git -C KernelSU describe --tags --always 2>/dev/null || echo unknown)"
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "glue applied to KernelSU $(git -C KernelSU describe --tags --always 2>/dev/null || echo unknown)"
+            echo "::endgroup::"
+          fi
+
+          origin=""
+          case "$SUSFS_SOURCE" in
+            vendored)
+              if ! apply_source "$VENDOR" "vendored"; then
+                echo "::error::vendored SUSFS failed its contract checks"
+                exit 1
+              fi
+              origin="vendored"
+              ;;
+            latest)
+              d=""
+              if ! d="$(fetch_latest)"; then
+                echo "::error::could not download latest SUSFS from $NGKI_RAW"
+                exit 1
+              fi
+              if ! apply_source "$d" "latest"; then
+                echo "::error::latest SUSFS failed its contract checks"
+                exit 1
+              fi
+              origin="latest"
+              ;;
+            auto)
+              d=""
+              d="$(fetch_latest)" || true
+              if [ -n "$d" ] && apply_source "$d" "latest"; then
+                origin="latest"
+              else
+                echo "::warning::latest SUSFS failed; rolling back and using vendored $SUSFS_FALLBACK_VERSION"
+                reset_tree
+                if ! apply_source "$VENDOR" "fallback"; then
+                  echo "::error::vendored fallback failed too"
+                  exit 1
+                fi
+                origin="fallback"
+              fi
+              ;;
+            *)
+              echo "::error::unknown susfs_source '$SUSFS_SOURCE'"
+              exit 1
+              ;;
+          esac
+
+          echo "version=$RESULT_VER" >> "$GITHUB_OUTPUT"
+          echo "tag=${RESULT_VER}-${origin}" >> "$GITHUB_OUTPUT"
+          echo "origin=$origin" >> "$GITHUB_OUTPUT"
+          echo "SUSFS result: $RESULT_VER ($origin)"
+
+      # --- config ---
+      - name: Configure KernelSU options
+        if: inputs.ksu != 'none'
+        shell: bash
+        env:
+          KSU_VARIANT: ${{ inputs.ksu }}
+        run: |
+          set -euo pipefail
+
+          set_cfg() {
+            local sym="$1" val="$2"
+            if grep -q "^${sym}=" out/.config; then
+              sed -i "s|^${sym}=.*|${sym}=${val}|" out/.config
+            elif grep -q "^# ${sym} is not set" out/.config; then
+              sed -i "s|^# ${sym} is not set|${sym}=${val}|" out/.config
+            else
+              echo "${sym}=${val}" >> out/.config
+            fi
+          }
+          unset_cfg() {
+            local sym="$1"
+            if grep -q "^${sym}=" out/.config; then
+              sed -i "s|^${sym}=.*|# ${sym} is not set|" out/.config
+            elif ! grep -q "^# ${sym} is not set" out/.config; then
+              echo "# ${sym} is not set" >> out/.config
+            fi
+          }
+
+          set_cfg CONFIG_KSU y
+          case "$KSU_VARIANT" in
+            xxksu|xxksu-susfs)
+              set_cfg CONFIG_KALLSYMS y
+              set_cfg CONFIG_KSU_HACK_ARM64_BRANCH_LINK y
+              unset_cfg CONFIG_KPROBES
+              ;;
+            bakasu-susfs)
+              set_cfg CONFIG_DEBUG_KERNEL y
+              set_cfg CONFIG_KALLSYMS y
+              set_cfg CONFIG_KALLSYMS_ALL y
+              unset_cfg CONFIG_KSU_MANUAL_HOOK
+              unset_cfg CONFIG_KSU_TRACEPOINT_HOOK
+              ;;
+          esac
+
+          SUSFS_OPTS=(
+            CONFIG_KSU_SUSFS
+            CONFIG_KSU_SUSFS_SUS_PATH
+            CONFIG_KSU_SUSFS_SUS_MOUNT
+            CONFIG_KSU_SUSFS_SUS_KSTAT
+            CONFIG_KSU_SUSFS_SPOOF_UNAME
+            CONFIG_KSU_SUSFS_ENABLE_LOG
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT
+            CONFIG_KSU_SUSFS_SUS_MAP
+          )
+          if [ "$KSU_VARIANT" = "xxksu-susfs" ] || [ "$KSU_VARIANT" = "bakasu-susfs" ]; then
+            for sym in "${SUSFS_OPTS[@]}"; do set_cfg "$sym" y; done
+          fi
+
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+
+          check() {
+            grep -q "^CONFIG_$1=y" out/.config \
+              || { echo "::error::CONFIG_$1 not enabled after olddefconfig"; exit 1; }
+          }
+
+          check KSU
+          case "$KSU_VARIANT" in
+            xxksu|xxksu-susfs)
+              check KSU_HACK_ARM64_BRANCH_LINK
+              ;;
+            bakasu-susfs)
+              check KSU_SUSFS
+              check KALLSYMS_ALL
+              check DEBUG_KERNEL
+              grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set' out/.config \
+                || { echo "::error::CONFIG_KSU_MANUAL_HOOK must be off (mutually exclusive with KSU_SUSFS)"; exit 1; }
+              ;;
+          esac
+          if [ "$KSU_VARIANT" = "xxksu-susfs" ] || [ "$KSU_VARIANT" = "bakasu-susfs" ]; then
+            for sym in "${SUSFS_OPTS[@]}"; do
+              check "${sym#CONFIG_}"
+            done
+          fi
+
+          echo "--- KernelSU / SUSFS config ---"
+          grep -E '^CONFIG_(KSU|KALLSYMS|DEBUG_KERNEL)|^# CONFIG_KSU' out/.config
+
+      # --- build ---
+      - name: Build
+        shell: bash
+        env:
+          KSU_VARIANT: ${{ inputs.ksu }}
+        run: |
+          set -euo pipefail
           ARGS=(O=out ARCH=arm64 CC=clang LD=ld.lld AS=llvm-as AR=llvm-ar NM=llvm-nm
                 OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
                 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -73,20 +407,47 @@ jobs:
           make -j"$(nproc --all)" "${ARGS[@]}" Image.gz-dtb 2>&1 | tee build.log
           test -f out/arch/arm64/boot/Image.gz-dtb
 
+          if [ "$KSU_VARIANT" = "xxksu-susfs" ] || [ "$KSU_VARIANT" = "bakasu-susfs" ]; then
+            test -f out/vmlinux \
+              || { echo "::error::out/vmlinux missing after build"; exit 1; }
+            strings out/vmlinux | grep -q 'susfs is initialized' \
+              || { echo "::error::SUSFS init message missing from vmlinux (SUSFS not linked in)"; exit 1; }
+            if grep -q ' susfs_init$' out/System.map; then
+              echo "SUSFS link assertion OK: $(grep -m1 ' susfs_init$' out/System.map)"
+            else
+              echo "::warning::susfs_init not in System.map (LTO-inlined); vmlinux string check passed"
+            fi
+          fi
+
+      # --- package ---
       - name: Package with AnyKernel3
+        id: package
+        shell: bash
+        env:
+          KSU_VARIANT: ${{ inputs.ksu }}
+          SUSFS_TAG: ${{ steps.susfs.outputs.tag }}
         run: |
+          set -euo pipefail
+          suffix=""
+          [ -n "${SUSFS_TAG:-}" ] && suffix="-$SUSFS_TAG"
+          name="SouthWest-NG-lavender-${KSU_VARIANT}${suffix}-$(date +%Y%m%d)"
+          echo "zip_name=$name" >> "$GITHUB_OUTPUT"
+
           git clone -q --depth=1 -b master "$AK3_REPO" AnyKernel3
           cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-          cd AnyKernel3
-          zip -r9 "../SouthWest-NG-lavender-${{ github.event.inputs.ksu }}-$(date +%Y%m%d).zip" * -x .git README.md "*placeholder*"
+          ( cd AnyKernel3 && zip -r9 "../$name.zip" . -x '.git/*' 'README.md' '*placeholder*' )
+          ls -lh "$name.zip"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: kernel-zip
-          path: SouthWest-NG-lavender-*.zip
+          name: kernel-zip-${{ inputs.ksu }}
+          path: ${{ steps.package.outputs.zip_name }}.zip
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: build-log
-          path: build.log
+          name: build-log-${{ inputs.ksu }}
+          path: |
+            build.log
+            out/System.map
+          if-no-files-found: ignore
