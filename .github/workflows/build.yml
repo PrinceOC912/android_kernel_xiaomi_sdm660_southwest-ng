@@ -105,6 +105,35 @@ jobs:
           WORK="$RUNNER_TEMP/susfs"
           mkdir -p "$WORK"
 
+          # --- For Legacy ---
+          if [ ! -d "$SD" ] || [ ! -f "$SD/xxksu-susfs.patch" ]; then
+            echo "::notice::SUSFS companion directory missing; fetching from main branch"
+            mkdir -p "$SD"
+            REPO="${GITHUB_REPOSITORY:-PrinceOC912/android_kernel_xiaomi_sdm660_southwest-ng}"
+            for f in xxksu-susfs.patch fixup_4.19_v2.3_nohook.patch fixup_4.19_v2.3_hooks.patch vendor/susfs_patch_to_4.19.patch vendor/susfs_inline_hook_patches.sh; do
+              mkdir -p "$SD/$(dirname "$f")"
+              curl -fLSs --retry 3 --retry-delay 2 -o "$SD/$f" "https://raw.githubusercontent.com/$REPO/main/$SUSFS_DIR/$f"
+            done
+          fi
+
+          if grep -q 'CONFIG_INITRAMFS_IGNORE_SKIP_FLAG' fs/proc/cmdline.c; then
+            LAYOUT=dynamic
+          else
+            LAYOUT=legacy
+          fi
+          echo "kernel layout: $LAYOUT"
+          # --- For Legacy ---
+
+          missing=0
+          for f in "$VENDOR/susfs_patch_to_4.19.patch" "$VENDOR/susfs_inline_hook_patches.sh"; do
+            [ -f "$f" ] || { echo "::error::missing companion file: $f"; missing=1; }
+          done
+          if [ "$KSU_VARIANT" = "xxksu-susfs" ] && [ ! -f "$SD/xxksu-susfs.patch" ]; then
+            echo "::error::missing companion file: $SD/xxksu-susfs.patch"
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+
           baseline="$(git status --porcelain=v1 | awk '{print $2}')"
 
           reset_tree() {
@@ -112,6 +141,9 @@ jobs:
               f="${line:3}"
               f="${f%% -> *}"
               [ -n "$f" ] || continue
+              if [ "$f" = ".github/" ] || [[ "$f" == .github/* ]]; then
+                continue
+              fi
               if printf '%s\n' "$baseline" | grep -qxF -- "$f"; then
                 continue
               fi
@@ -141,13 +173,23 @@ jobs:
             else
               f="$SD/fixup_4.19_${mm}_nohook.patch"
             fi
-            [ -f "$f" ] || { echo "no overlay for SUSFS $ver: $f" >&2; return 1; }
+            [ -f "$f" ] || { echo "::error::missing overlay for SUSFS $ver: $f" >&2; return 1; }
             printf '%s\n' "$f"
           }
 
           check_rejects() {
-            local label="$1" ok=1 e f n got actual want
-            want="$(printf '%s\n' fs/namespace.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/super.c | sort)"
+            local label="$1" ok=1 e f n got actual want counts msg
+            want="fs/namespace.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/super.c"
+            counts="fs/namespace.c:2 fs/proc/cmdline.c:1 fs/proc/task_mmu.c:1 fs/super.c:1"
+            msg="4 files / 5 hunks"
+            # --- For Legacy ---
+            if [ "$LAYOUT" = legacy ]; then
+              want="fs/namespace.c fs/proc/task_mmu.c fs/super.c"
+              counts="fs/namespace.c:2 fs/proc/task_mmu.c:1 fs/super.c:1"
+              msg="3 files / 4 hunks (legacy)"
+            fi
+            # --- For Legacy ---
+            want="$(printf '%s\n' $want | sort)"
             actual="$(find . -name '*.rej' -not -path './KernelSU/*' | sed -e 's|^\./||' -e 's|\.rej$||' | sort)"
             if [ "$actual" != "$want" ]; then
               echo "::error::[$label] unexpected reject set"
@@ -155,7 +197,7 @@ jobs:
               echo "--- actual ---";   printf '%s\n' "$actual"
               ok=0
             fi
-            for e in fs/namespace.c:2 fs/proc/cmdline.c:1 fs/proc/task_mmu.c:1 fs/super.c:1; do
+            for e in $counts; do
               f="${e%%:*}"; n="${e##*:}"
               if [ ! -f "$f.rej" ]; then
                 echo "::error::[$label] missing $f.rej"
@@ -169,7 +211,7 @@ jobs:
               fi
             done
             if [ "$ok" -eq 1 ]; then
-              echo "[$label] reject gate OK: 4 files / 5 hunks, all expected"
+              echo "[$label] reject gate OK: $msg, all expected"
               return 0
             fi
             return 1
@@ -219,7 +261,13 @@ jobs:
             fi
 
             patch -p1 --no-backup-if-mismatch < "$patch" > "$WORK/kernel-$label.log" 2>&1 || prc=$?
-            echo "patch exit=$prc (non-zero is expected: the overlay repairs 5 hunks)"
+            hunks="5 hunks"
+            # --- For Legacy ---
+            if [ "$LAYOUT" = legacy ]; then
+              hunks="4 hunks"
+            fi
+            # --- For Legacy ---
+            echo "patch exit=$prc (non-zero is expected: the overlay repairs $hunks)"
             grep -E 'FAILED|saving rejects|with fuzz' "$WORK/kernel-$label.log" || true
 
             if ! check_rejects "$label"; then
@@ -228,12 +276,18 @@ jobs:
             fi
             find . -name '*.rej'  -not -path './KernelSU/*' -delete 2>/dev/null || true
             find . -name '*.orig' -not -path './KernelSU/*' -delete 2>/dev/null || true
-            if ! git apply --check "$fixup"; then
+            excludes=()
+            # --- For Legacy ---
+            if [ "$LAYOUT" = legacy ]; then
+              excludes=(--exclude=fs/proc/cmdline.c)
+            fi
+            # --- For Legacy ---
+            if ! git apply --check "${excludes[@]}" "$fixup"; then
               echo "[$label] overlay does not apply"
               echo "::endgroup::"
               return 1
             fi
-            if ! git apply "$fixup"; then
+            if ! git apply "${excludes[@]}" "$fixup"; then
               echo "[$label] overlay failed to apply"
               echo "::endgroup::"
               return 1
@@ -247,6 +301,11 @@ jobs:
 
           if [ "$KSU_VARIANT" = "xxksu-susfs" ]; then
             echo "::group::xxksu SUSFS glue"
+            if [ ! -f "$SD/xxksu-susfs.patch" ]; then
+              echo "::error::missing companion file: $SD/xxksu-susfs.patch"
+              echo "::endgroup::"
+              exit 1
+            fi
             if ! git -C KernelSU apply "$SD/xxksu-susfs.patch"; then
               echo "::error::xxksu-susfs.patch does not apply to KernelSU $(git -C KernelSU describe --tags --always 2>/dev/null || echo unknown)"
               echo "::endgroup::"
@@ -299,7 +358,13 @@ jobs:
           esac
 
           echo "version=$RESULT_VER" >> "$GITHUB_OUTPUT"
-          echo "tag=${RESULT_VER}-${origin}" >> "$GITHUB_OUTPUT"
+          tag="${RESULT_VER}-${origin}"
+          # --- For Legacy ---
+          if [ "$LAYOUT" = legacy ]; then
+            tag="${tag}-legacy"
+          fi
+          # --- For Legacy ---
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "origin=$origin" >> "$GITHUB_OUTPUT"
           echo "SUSFS result: $RESULT_VER ($origin)"
 
