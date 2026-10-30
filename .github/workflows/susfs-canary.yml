@@ -1,0 +1,144 @@
+name: SUSFS upstream canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+env:
+  SUSFS_DIR: .github/workflows/susfs
+  NGKI_RAW: https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patch git curl
+
+      - name: Fetch latest SUSFS
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/susfs"; mkdir -p "$d"
+          curl -fLSs --retry 3 --retry-delay 2 \
+            -o "$d/p.patch" "$NGKI_RAW/Patches/Patch/susfs_patch_to_4.19.patch"
+          curl -fLSs --retry 3 --retry-delay 2 \
+            -o "$d/h.sh" "$NGKI_RAW/Patches/susfs_inline_hook_patches.sh"
+          grep -q '^diff --git' "$d/p.patch"
+          grep -q 'patch_files=' "$d/h.sh"
+          ver="$(grep -m1 -oE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' "$d/p.patch" \
+                 | sed -E 's/.*"([^"]+)".*/\1/')"
+          mm="$(printf '%s\n' "$ver" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "mm=$mm" >> "$GITHUB_OUTPUT"
+          echo "dir=$d" >> "$GITHUB_OUTPUT"
+          echo "Upstream SUSFS: $ver (overlay key: $mm)"
+
+      - name: Overlays exist
+        shell: bash
+        env:
+          MM: ${{ steps.fetch.outputs.mm }}
+          VER: ${{ steps.fetch.outputs.version }}
+        run: |
+          set -euo pipefail
+          for f in "fixup_4.19_${MM}_nohook.patch" "fixup_4.19_${MM}_hooks.patch"; do
+            if [ -f "$SUSFS_DIR/$f" ]; then
+              echo "OK $f"
+            else
+              echo "::error::missing $f for upstream SUSFS $VER -- release builds will fall back to vendored"
+              exit 1
+            fi
+          done
+
+      - name: Kernel patch + both overlays
+        shell: bash
+        env:
+          DIR: ${{ steps.fetch.outputs.dir }}
+          MM: ${{ steps.fetch.outputs.mm }}
+        run: |
+          set -euo pipefail
+
+          reset_tree() { git checkout -q -- . && git clean -ffdq && rm -rf KernelSU drivers/kernelsu; }
+
+          check_rejects() {
+            local label="$1" ok=1 e f n got actual want
+            want="$(printf '%s\n' fs/namespace.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/super.c | sort)"
+            actual="$(find . -name '*.rej' | sed -e 's|^\./||' -e 's|\.rej$||' | sort)"
+            if [ "$actual" != "$want" ]; then
+              echo "::error::[$label] unexpected reject set"
+              echo "--- expected ---"; printf '%s\n' "$want"
+              echo "--- actual ---";   printf '%s\n' "$actual"
+              find . -name '*.rej' -exec sh -c 'echo "===== $1"; cat "$1"' _ {} \;
+              ok=0
+            fi
+            for e in fs/namespace.c:2 fs/proc/cmdline.c:1 fs/proc/task_mmu.c:1 fs/super.c:1; do
+              f="${e%%:*}"; n="${e##*:}"
+              if [ ! -f "$f.rej" ]; then echo "::error::[$label] missing $f.rej"; ok=0; continue; fi
+              got="$(grep -c '^@@' "$f.rej" || true)"
+              [ "$got" = "$n" ] || { echo "::error::[$label] $f.rej has $got hunk(s), expected $n"; ok=0; }
+            done
+            [ "$ok" -eq 1 ] && echo "[$label] reject gate OK"
+            return $((1 - ok))
+          }
+
+          test_overlay() {
+            local fixup="$1" label="$2"
+            reset_tree
+            patch -p1 --no-backup-if-mismatch < "$DIR/p.patch" > /dev/null 2>&1 || true
+            check_rejects "$label" || return 1
+            find . -name '*.rej' -delete
+            git apply "$fixup" || { echo "::error::[$label] $fixup does not apply"; return 1; }
+            echo "[$label] OK: $fixup"
+          }
+
+          test_overlay "$SUSFS_DIR/fixup_4.19_${MM}_nohook.patch" "nohook"
+          test_overlay "$SUSFS_DIR/fixup_4.19_${MM}_hooks.patch"  "hooks"
+          reset_tree
+
+      - name: xxksu glue still applies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU drivers/kernelsu
+          curl -fLSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
+          echo "xxksu: $(git -C KernelSU log -1 --format='%h %ad %s' --date=short)"
+          patch="$PWD/$SUSFS_DIR/xxksu-susfs.patch"
+          if ! git -C KernelSU apply --check "$patch"; then
+            echo "::error::xxksu-susfs.patch no longer applies to xxksu master -- refresh the glue patch"
+            git -C KernelSU apply -v "$patch" || true
+            exit 1
+          fi
+          echo "OK xxksu-susfs.patch applies"
+          git checkout -q -- . && git clean -ffdq && rm -rf KernelSU drivers/kernelsu
+
+      - name: BakaSU inline hooks still run
+        shell: bash
+        env:
+          DIR: ${{ steps.fetch.outputs.dir }}
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU drivers/kernelsu
+          curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+          echo "BakaSU: $(git -C KernelSU log -1 --format='%h %ad %s' --date=short)"
+          if ! bash "$DIR/h.sh" > inline.log 2>&1; then
+            echo "::error::SUSFS inline hook script failed on current BakaSU"
+            tail -n 80 inline.log
+            exit 1
+          fi
+          if grep -qiE 'patch failed|failed for unknown reasons' inline.log; then
+            echo "::error::SUSFS inline hook script reported a failed patch"
+            tail -n 80 inline.log
+            exit 1
+          fi
+          grep -E 'Patched!|Skipped' inline.log || true
+          echo "OK inline hook script"
