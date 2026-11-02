@@ -55,21 +55,38 @@ jobs:
           set -euo pipefail
           v="$SUSFS_DIR/vendor"
           drift=0
+          cmds=()
           SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
-          { echo "### Vendored fallback vs upstream"; echo; echo "| file | status |"; echo "|---|---|"; } >> "$SUMMARY"
+
+          # Links: upstream is derived from NGKI_RAW, your copy from the running repo.
+          up_blob="$(printf '%s' "$NGKI_RAW" | sed -E 's|raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)|github.com/\1/\2/blob/\3|')"
+          up_hist="${up_blob/\/blob\//\/commits\/}"
+          me=""
+          if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+            me="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY"
+            ref="${GITHUB_REF_NAME:-main}"
+          fi
+
+          { echo "### Vendored fallback vs upstream"; echo; echo "| file | status | links |"; echo "|---|---|---|"; } >> "$SUMMARY"
 
           files_of() { { grep '^diff --git' "$1" | awk '{print $3}' | sed 's|^a/||' | sort; } || true; }
 
+          # compare <name> <upstream file> <vendored file> <path of the file inside the upstream repo>
           compare() {
-            local name="$1" up="$2" vend="$3" changed added removed
+            local name="$1" up="$2" vend="$3" rel="$4" changed added removed links
+            links="[upstream]($up_blob/$rel) · [history]($up_hist/$rel) · [raw]($NGKI_RAW/$rel)"
+            if [ -n "$me" ]; then
+              links="$links · [your copy]($me/blob/$ref/$vend) · [upload here]($me/upload/$ref/$v)"
+            fi
             if [ ! -f "$vend" ]; then
-              echo "::warning title=Vendored SUSFS copy missing::$vend not found"
-              echo "| $name | vendored copy missing |" >> "$SUMMARY"
+              echo "::warning title=Vendored SUSFS copy missing::$vend not found. Upstream: $up_blob/$rel"
+              echo "| $name | vendored copy missing | $links |" >> "$SUMMARY"
+              cmds+=("mkdir -p $v && curl -fLo $vend $NGKI_RAW/$rel")
               drift=1; return 0
             fi
             if cmp -s "$up" "$vend"; then
               echo "OK $name identical to upstream"
-              echo "| $name | identical |" >> "$SUMMARY"
+              echo "| $name | identical | |" >> "$SUMMARY"
               return 0
             fi
             drift=1
@@ -81,15 +98,24 @@ jobs:
             echo "  sha256 upstream: $(sha256sum "$up"   | cut -d' ' -f1)"
             [ -z "$added" ]   || echo "  files only in upstream: $added"
             [ -z "$removed" ] || echo "  files only in vendored: $removed"
-            echo "::warning title=Vendored SUSFS fallback differs from upstream::$name: $changed changed lines (upstream-only files: ${added:-none}; vendored-only files: ${removed:-none}). Release builds that fall back to vendor/ will not match auto mode."
-            echo "| $name | **differs**: $changed changed lines; upstream-only files: ${added:-none}; vendored-only files: ${removed:-none} |" >> "$SUMMARY"
+            echo "  upstream: $up_blob/$rel"
+            echo "::warning title=Vendored SUSFS fallback differs from upstream::$name: $changed changed lines (upstream-only files: ${added:-none}; vendored-only files: ${removed:-none}). Upstream: $up_blob/$rel  History: $up_hist/$rel"
+            echo "| $name | **differs**: $changed changed lines; upstream-only files: ${added:-none}; vendored-only files: ${removed:-none} | $links |" >> "$SUMMARY"
+            cmds+=("curl -fLo $vend $NGKI_RAW/$rel")
           }
 
-          compare "susfs_patch_to_4.19.patch"     "$DIR/p.patch" "$v/susfs_patch_to_4.19.patch"
-          compare "susfs_inline_hook_patches.sh"  "$DIR/h.sh"    "$v/susfs_inline_hook_patches.sh"
+          compare "susfs_patch_to_4.19.patch"    "$DIR/p.patch" "$v/susfs_patch_to_4.19.patch"    "Patches/Patch/susfs_patch_to_4.19.patch"
+          compare "susfs_inline_hook_patches.sh" "$DIR/h.sh"    "$v/susfs_inline_hook_patches.sh" "Patches/susfs_inline_hook_patches.sh"
 
           if [ "$drift" -eq 1 ]; then
-            { echo; echo "Refresh \`$v/\` from upstream, re-run this canary, then re-check the reject gate."; } >> "$SUMMARY"
+            {
+              echo
+              echo "**Refresh locally** (from the repo root), then review \`git diff\` and re-run this canary:"
+              echo
+              echo '```bash'
+              printf '%s\n' "${cmds[@]}"
+              echo '```'
+            } >> "$SUMMARY"
           fi
           exit 0
 
@@ -194,12 +220,12 @@ jobs:
           # 1) inline hook script
           if ! bash "$DIR/h.sh" > inline.log 2>&1; then
             echo "::error::SUSFS inline hook script failed on current BakaSU"
-            tail -n 200 inline.log
+            tail -n 80 inline.log
             exit 1
           fi
           if grep -qiE 'patch failed|failed for unknown reasons' inline.log; then
             echo "::error::SUSFS inline hook script reported a failed patch"
-            tail -n 200 inline.log
+            tail -n 80 inline.log
             exit 1
           fi
           grep -E 'Patched!|Skipped' inline.log || true
