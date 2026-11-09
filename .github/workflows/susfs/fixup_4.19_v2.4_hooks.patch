@@ -1,0 +1,120 @@
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 368b5c7ff..45d0178fa 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -26,11 +26,22 @@
+ #include <linux/bootmem.h>
+ #include <linux/task_work.h>
+ #include <linux/sched/task.h>
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs_def.h>
++#endif // #ifdef CONFIG_KSU_SUSFS
+ #include <linux/fs_context.h>
+ 
+ #include "pnode.h"
+ #include "internal.h"
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++extern bool susfs_is_current_ksu_domain(void);
++extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
++
++#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
++
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++
+ /* Maximum number of mounts in a mount namespace */
+ unsigned int sysctl_mount_max __read_mostly = 100000;
+ 
+@@ -1091,7 +1102,21 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
+ 		return ERR_PTR(-EINVAL);
+ 	sb = fc->root->d_sb;
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++	// - We will just stop checking for ksu process if /sdcard/Android is accessible,
++	//   for the sake of performance
++	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
++		if (susfs_is_current_ksu_domain()) {
++			mnt = susfs_alloc_non_unshare_ksu_vfsmnt(fc->source ?: "none");
++			goto bypass_orig_flow;
++		}
++	}
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++
+ 	mnt = alloc_vfsmnt(fc->source ?: "none");
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++bypass_orig_flow:
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+ 	if (!mnt)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/fs/proc/cmdline.c b/fs/proc/cmdline.c
+index bf4aafae3..ca362ea68 100644
+--- a/fs/proc/cmdline.c
++++ b/fs/proc/cmdline.c
+@@ -7,6 +7,11 @@
+ #include <asm/setup.h>
+ #endif
+ 
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
++extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
++#endif
++
+ #ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG
+ #define INITRAMFS_STR_FIND "skip_initramf"
+ #define INITRAMFS_STR_REPLACE "want_initramf"
+@@ -29,6 +34,13 @@ static void proc_command_line_init(void) {
+ 
+ static int cmdline_proc_show(struct seq_file *m, void *v)
+ {
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++	if (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
++		susfs_spoof_cmdline_or_bootconfig(m);
++		seq_putc(m, '\n');
++		return 0;
++	}
++#endif
+ #ifdef CONFIG_INITRAMFS_IGNORE_SKIP_FLAG
+ 	seq_puts(m, proc_command_line);
+ #else
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 64ad533bd..fba15b3b1 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1680,7 +1680,15 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
+ 		ret = mmap_read_lock_killable(mm);
+ 		if (ret)
+ 			goto out_free;
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++		vma = find_vma(mm, start_vaddr);
++		if (vma && vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
++			goto bypass_orig_flow;
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 		ret = walk_page_range(start_vaddr, end, &pagemap_walk);
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++bypass_orig_flow:
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
+ 		mmap_read_unlock(mm);
+ 		start_vaddr = end;
+ 
+diff --git a/fs/super.c b/fs/super.c
+index 4dd020c92..5fa28d414 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -37,8 +37,16 @@
+ #include <linux/lockdep.h>
+ #include <linux/user_namespace.h>
+ #include <linux/fs_context.h>
++#ifdef CONFIG_KSU_SUSFS
++#include <linux/susfs_def.h>
++#endif // #ifdef CONFIG_KSU_SUSFS
+ #include "internal.h"
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++extern bool susfs_is_current_ksu_domain(void);
++extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++
+ static int thaw_super_locked(struct super_block *sb);
+ 
+ static LIST_HEAD(super_blocks);
